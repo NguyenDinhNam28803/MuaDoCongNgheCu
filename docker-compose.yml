@@ -1,0 +1,43 @@
+# Môi trường dev: PostgreSQL + kho ảnh S3-compatible (SeaweedFS; production dùng Cloudflare R2).
+# Chạy: docker compose up -d   (hoặc trong client/: pnpm db:up)
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: muaban-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: muaban
+      POSTGRES_PASSWORD: muaban
+      POSTGRES_DB: muaban
+    ports:
+      - "5434:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U muaban -d muaban"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  storage:
+    image: chrislusf/seaweedfs:3.97
+    container_name: muaban-storage
+    restart: unless-stopped
+    command: >
+      server -dir=/data -ip=localhost -ip.bind=0.0.0.0
+      -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json -s3.allowedOrigins=*
+    ports:
+      - "8333:8333" # S3 API
+    volumes:
+      - storage-data:/data
+      - ./docker/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  db-data:
+  storage-data:

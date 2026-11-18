@@ -1,0 +1,360 @@
+// Schema lõi theo báo cáo "Nền tảng quản lý & bán đồ công nghệ (mới + cũ)".
+// Nguyên tắc:
+//  - Mọi thiết bị có IMEI/serial (kể cả máy mới) là một bản ghi Device riêng.
+//    Chỉ phụ kiện quản lý theo số lượng ở ProductVariant.stockQty.
+//  - Giá luôn là số nguyên VND (BigInt), không dùng số thực.
+//  - Đổi Device.status CHỈ qua src/server/devices (hàm transition), không ghi thẳng.
+//  - InspectionReport và DeviceEvent chỉ ghi thêm, không sửa.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────── Enums ─────────────
+
+enum Role {
+  OWNER // xem giá vốn, lãi, sửa giá
+  STAFF // bán, nhập máy; không thấy giá vốn
+}
+
+enum ProductCategory {
+  PHONE
+  LAPTOP
+  TABLET
+  WATCH
+  ACCESSORY
+  OTHER
+}
+
+enum Condition {
+  NEW
+  USED
+}
+
+/// Phân hạng máy cũ; tiêu chí viết rõ ở trang chính sách. Null với máy mới.
+enum Grade {
+  A
+  B
+  C
+}
+
+enum DeviceStatus {
+  INTAKE // Tiếp nhận
+  INSPECTING // Kiểm định
+  REFURBISHING // Tân trang
+  LISTED // Đang bán
+  RESERVED // Đang giữ (khách đặt)
+  SOLD // Đã bán
+  RETURNED // Trả về (đổi trả / bảo hành)
+  REJECTED // Loại bỏ (không đạt / khóa tài khoản)
+}
+
+enum AcquisitionType {
+  TRADE_IN // thu từ khách lẻ
+  WHOLESALE // nhập buôn (máy cũ)
+  NEW_STOCK // nhập máy mới từ nhà phân phối
+}
+
+enum DeviceCostType {
+  REFURBISH // linh kiện, công tân trang
+  WARRANTY_RESERVE // dự phòng bảo hành
+  PAYMENT_FEE // phí thanh toán
+  SHIPPING // vận chuyển
+  OTHER
+}
+
+enum OrderChannel {
+  ONLINE
+  COUNTER // bán nhanh tại quầy
+}
+
+enum OrderStatus {
+  PENDING // khách vừa đặt, chờ shop xác nhận
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  COD
+  BANK_TRANSFER // VietQR
+}
+
+// ───────────── Người dùng nội bộ ─────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  phone        String   @unique
+  passwordHash String
+  role         Role     @default(STAFF)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  inspections  InspectionReport[]
+  deviceEvents DeviceEvent[]
+  acquisitions Acquisition[]
+  orders       Order[]
+  sessions     Session[]
+}
+
+/// Phiên đăng nhập. id = SHA-256 hex của token trong cookie (DB không lưu token gốc).
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Nhật ký đăng nhập để khóa tạm khi sai mật khẩu nhiều lần.
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  phone     String
+  success   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([phone, createdAt])
+}
+
+// ───────────── Catalog ─────────────
+
+model Product {
+  id        String          @id @default(cuid())
+  slug      String          @unique
+  name      String // "iPhone 15 Pro"
+  brand     String
+  category  ProductCategory
+  /// Ẩn thay vì xóa khi đã có máy/đơn tham chiếu
+  archived  Boolean         @default(false)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  variants ProductVariant[]
+}
+
+model ProductVariant {
+  id             String   @id @default(cuid())
+  productId      String
+  sku            String   @unique
+  color          String?
+  storage        String? // "256GB"
+  ram            String? // laptop
+  /// true: quản lý theo từng máy (Device); false: phụ kiện, quản lý theo số lượng
+  isSerialized   Boolean  @default(true)
+  /// Giá tham chiếu để định giá thu (chủ shop cập nhật)
+  referencePrice BigInt?
+  /// Giá máy mới niêm yết, để khách so sánh
+  newPrice       BigInt?
+  /// Chỉ dùng cho phụ kiện (isSerialized = false)
+  stockQty       Int      @default(0)
+  archived       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  product    Product     @relation(fields: [productId], references: [id])
+  devices    Device[]
+  orderItems OrderItem[]
+
+  @@index([productId])
+}
+
+// ───────────── Thiết bị & kho ─────────────
+
+model Device {
+  id            String       @id @default(cuid())
+  imei          String?      @unique
+  serial        String?      @unique
+  variantId     String
+  acquisitionId String?
+  condition     Condition
+  grade         Grade?
+  /// Phân biệt "đã tân trang" và "nguyên trạng" (As Is)
+  isRefurbished Boolean      @default(false)
+  regionCode    String? // VN/A, J/A, LL/A…
+  status        DeviceStatus @default(INTAKE)
+  costPrice     BigInt // giá vốn (giá thu / giá nhập), chỉ OWNER xem
+  listPrice     BigInt?
+  batteryPct    Int?
+  /// Giữ máy: status = RESERVED và reservedUntil > now(). Hết hạn xử lý "lười".
+  reservedUntil DateTime?
+  /// Khóa lạc quan cho compare-and-set
+  version       Int          @default(0)
+  listedAt      DateTime?
+  soldAt        DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  variant     ProductVariant     @relation(fields: [variantId], references: [id])
+  acquisition Acquisition?       @relation(fields: [acquisitionId], references: [id])
+  inspections InspectionReport[]
+  events      DeviceEvent[]
+  costs       DeviceCost[]
+  orderItems  OrderItem[]
+  warranties  Warranty[]
+
+  @@index([status, variantId])
+}
+
+/// Bất biến: kiểm lại thì tạo bản mới.
+model InspectionReport {
+  id              String   @id @default(cuid())
+  deviceId        String
+  inspectorId     String
+  templateVersion Int
+  /// Kết quả checklist chạm-chọn: [{ key, label, ok, note? }]
+  checklist       Json
+  batteryPct      Int?
+  grade           Grade?
+  replacedParts   String[]
+  /// Key ảnh trên object storage (R2/S3), 4–6 ảnh
+  photoKeys       String[]
+  /// Bắt buộc false để được lên kệ (iCloud/Google/MDM)
+  accountLocked   Boolean
+  /// Bắt buộc true để được lên kệ
+  dataWiped       Boolean
+  passed          Boolean
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  device     Device      @relation(fields: [deviceId], references: [id])
+  inspector  User        @relation(fields: [inspectorId], references: [id])
+  orderItems OrderItem[]
+
+  @@index([deviceId, createdAt])
+}
+
+/// Nhật ký chuyển trạng thái, chỉ ghi thêm. Cũng là lịch sử giữ máy.
+model DeviceEvent {
+  id         String        @id @default(cuid())
+  deviceId   String
+  fromStatus DeviceStatus?
+  toStatus   DeviceStatus
+  actorId    String?
+  reason     String?
+  createdAt  DateTime      @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+  actor  User?  @relation(fields: [actorId], references: [id])
+
+  @@index([deviceId, createdAt])
+}
+
+/// Chi phí phát sinh theo máy, dùng để tính lãi gộp.
+model DeviceCost {
+  id        String         @id @default(cuid())
+  deviceId  String
+  type      DeviceCostType
+  amount    BigInt
+  note      String?
+  createdAt DateTime       @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId])
+}
+
+/// Nguồn vào của máy. Thông tin người bán chỉ OWNER xem được.
+model Acquisition {
+  id             String          @id @default(cuid())
+  type           AcquisitionType
+  sellerName     String?
+  sellerPhone    String?
+  /// Key ảnh giấy tờ trên bucket riêng (mã hóa, chỉ xem qua URL ký tạm)
+  sellerIdDocKey String?
+  /// Người bán đã ký cam kết nguồn gốc
+  originPledged  Boolean         @default(false)
+  /// Người bán đồng ý cho lưu thông tin cá nhân (Luật BVDLCN)
+  sellerConsent  Boolean         @default(false)
+  /// Tên nguồn buôn / nhà phân phối (khi không phải thu từ khách lẻ)
+  sourceName     String?
+  totalPrice     BigInt
+  note           String?
+  createdById    String
+  createdAt      DateTime        @default(now())
+
+  createdBy User     @relation(fields: [createdById], references: [id])
+  devices   Device[]
+}
+
+// ───────────── Đơn hàng & bảo hành ─────────────
+
+/// Đơn online và đơn tại quầy dùng chung.
+model Order {
+  id            String        @id @default(cuid())
+  code          String        @unique
+  channel       OrderChannel
+  status        OrderStatus   @default(PENDING)
+  customerName  String
+  customerPhone String
+  address       String?
+  paymentMethod PaymentMethod
+  totalAmount   BigInt
+  note          String?
+  createdById   String? // null với đơn online
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  createdBy  User?      @relation(fields: [createdById], references: [id])
+  items      OrderItem[]
+  warranties Warranty[]
+
+  @@index([customerPhone])
+}
+
+/// Máy có serial: deviceId; phụ kiện: variantId + quantity.
+/// Chụp lại giá và báo cáo kiểm định tại thời điểm mua.
+model OrderItem {
+  id                 String  @id @default(cuid())
+  orderId            String
+  deviceId           String?
+  variantId          String?
+  quantity           Int     @default(1)
+  unitPrice          BigInt
+  inspectionReportId String?
+
+  order            Order             @relation(fields: [orderId], references: [id])
+  device           Device?           @relation(fields: [deviceId], references: [id])
+  variant          ProductVariant?   @relation(fields: [variantId], references: [id])
+  inspectionReport InspectionReport? @relation(fields: [inspectionReportId], references: [id])
+
+  @@index([orderId])
+  @@index([deviceId])
+}
+
+/// Tra cứu công khai bằng IMEI + số điện thoại.
+model Warranty {
+  id            String   @id @default(cuid())
+  deviceId      String
+  orderId       String
+  customerPhone String
+  startsAt      DateTime
+  endsAt        DateTime
+  terms         String?
+  createdAt     DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+  order  Order  @relation(fields: [orderId], references: [id])
+
+  @@index([customerPhone])
+  @@index([deviceId])
+}
+
+// ───────────── Cấu hình shop ─────────────
+
+/// Ví dụ: key = "reservation.holdMinutes", value = 120
+model ShopSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

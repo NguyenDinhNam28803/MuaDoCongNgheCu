@@ -1,0 +1,13 @@
+{
+  "identities": [
+    {
+      "name": "muaban",
+      "credentials": [{ "accessKey": "muaban", "secretKey": "muaban-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "anonymous",
+      "actions": ["Read:muaban-public"]
+    }
+  ]
+}
